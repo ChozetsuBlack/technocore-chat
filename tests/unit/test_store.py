@@ -9,6 +9,7 @@ import pytest
 from _client import (
     _age,
     _at,
+    _keypair,
     _race_before_lock,
     _stats_for,
 )
@@ -263,7 +264,7 @@ def test_rejected_write_leaves_no_lock_file(tmp_path, monkeypatch):
     for i in range(5):
         with pytest.raises(store.StoreError, match="room limit"):
             store.append(tmp_path, f"flood{i}", "bot", "hi")
-    assert list((tmp_path / "rooms").glob("*.lock")) == [
+    assert list((tmp_path / "rooms").rglob("*.lock")) == [
         store.room_path(tmp_path, "only").with_suffix(".jsonl.lock")
     ]
 
@@ -297,8 +298,8 @@ def test_note_cap_holds_under_concurrent_creates(tmp_path, monkeypatch):
     monkeypatch.setattr(store, "MAX_NOTES_TOTAL", 4)
     real_check = store._check_note_capacity
 
-    def slow_check(root, path):
-        real_check(root, path)
+    def slow_check(root, ns_dir, path):
+        real_check(root, ns_dir, path)
         time.sleep(0.02)  # widen the count→write window every racer must lose
 
     monkeypatch.setattr(store, "_check_note_capacity", slow_check)
@@ -314,7 +315,7 @@ def test_note_cap_holds_under_concurrent_creates(tmp_path, monkeypatch):
     threads = [threading.Thread(target=create, args=(i,)) for i in range(8)]
     [t.start() for t in threads]
     [t.join() for t in threads]
-    assert sum(1 for _ in (tmp_path / "notes").glob("*/*.txt")) == 4
+    assert sum(1 for _ in (tmp_path / "notes").rglob("*.txt")) == 4
 
 
 def test_orphan_locks_are_swept(tmp_path):
@@ -453,6 +454,32 @@ def test_reap_keeps_a_file_refreshed_after_the_stat(tmp_path, monkeypatch):
     _race_under_lock(monkeypatch, store, refresh)
     _reap_now(tmp_path)
     assert path.exists()
+
+
+def test_reap_keeps_a_note_refreshed_after_the_stat(tmp_path, monkeypatch):
+    """The same recheck, on the nested half of the walk.
+
+    Rooms and notes are two passes of one loop over one `_walk`, and only the room pass was
+    covered. The trap this guards is that `os.DirEntry.stat()` caches: the reaper stats once
+    to decide a file is idle and again under the lock to catch a writer who got in between,
+    and a recheck reading the cached value silently returns the pre-lock answer. That is not
+    a slower reap, it is a deleted note somebody had just written — so it is pinned on both
+    branches rather than on whichever one happened to have a test.
+    """
+    import store
+
+    store.note_set(tmp_path, "plans", "k", "v")
+    path = store.note_path(tmp_path, "plans", "k")
+    _age(path, store.IDLE_SECONDS + 60)
+
+    def refresh(target):
+        if os.fspath(target) == os.fspath(path):  # only the note under test
+            os.utime(target, None)
+
+    _race_under_lock(monkeypatch, store, refresh)
+    _reap_now(tmp_path)
+    assert path.exists(), "a note refreshed between the walk and the lock must survive"
+    assert store.note_get(tmp_path, "plans", "k") == "v"
 
 
 def test_trusting_every_peer_would_hand_the_caller_its_own_rate_limit_identity():
@@ -1044,3 +1071,34 @@ def test_topic_previews_ride_the_notes_counter_not_only_a_clock(tmp_path):
     store.note_path(tmp_path, store.TOPIC_NS, "aaa").unlink()  # a reaper-style deletion
     with config.override(NOTE_STATS_CACHE_SECONDS=0):
         assert topics()["aaa"] is None  # visible once the clock (here: disabled) expires
+
+
+def test_a_json_escaped_did_is_the_one_record_the_nonce_scan_cannot_see(tmp_path):
+    """The stated boundary of `_last_nonce`'s bytes-level reject, not a wish.
+
+    The reject assumes the DID is in the line as itself. Both encoders this store has ever
+    written rooms with put it there literally — test_json_backend.py pins that byte-for-byte
+    — so the only way to produce the record below is to write the file with something else.
+    `_parse` still yields the right `from`, and the scan still skips it, which means a replay
+    of that record's nonce is accepted while the record sits in the window.
+
+    That is a real narrowing, kept deliberately: covering it costs a second scan of every
+    line (2.1 ms -> 3.7 ms against a 4.1 ms baseline on tests/capacity_bench.py), which is
+    most of what the reject buys, to defend files this store did not write. Make the scan
+    escape-aware and this test is what tells you: delete it and pin the opposite.
+    """
+    import didkey
+    import store
+
+    did, _ = _keypair()
+    assert didkey.is_did(did)  # a key the verifier would accept, not a did-shaped string
+    escaped = "".join(f"\\u{ord(c):04x}" for c in did)
+    room = store.room_path(tmp_path, "lobby")
+    room.parent.mkdir(parents=True)
+    room.write_bytes(
+        b'{"seq":1,"ts":"t","from":"' + escaped.encode() + b'","text":"signed","nonce":7}\n'
+    )
+    rec = store._parse(room.read_bytes())
+    assert rec is not None and rec["from"] == did  # legal JSON, and it parses to the DID
+    assert did.encode() not in room.read_bytes()  # but not present as itself, so:
+    assert store._last_nonce(tmp_path, "lobby", did) is None
