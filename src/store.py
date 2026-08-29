@@ -773,6 +773,109 @@ def read_messages(root: Path, room: str, limit: int = 50, since: int | None = No
     }
 
 
+# One chunk of an export in flight at a time, so a slow reader holds 64 KiB and never the
+# room: the body itself is already bounded by MAX_ROOM_BYTES.
+EXPORT_CHUNK = 65536
+
+
+def _snapshot_bytes(f) -> int:
+    """How many bytes of `f` are complete lines: its size at one fstat, truncated back to
+    the last newline.
+
+    A record exists once its newline does — the append path writes line-atomically and
+    heals a torn tail by the same rule — so everything inside this bound parses and
+    anything past it is a write still in flight, which must cost only itself."""
+    pos = os.fstat(f.fileno()).st_size
+    while pos > 0:
+        step = min(EXPORT_CHUNK, pos)
+        f.seek(pos - step)
+        if (nl := f.read(step).rfind(b"\n")) != -1:
+            return pos - step + nl + 1
+        pos -= step
+    return 0
+
+
+def _export_start(f, cutoff: float | None, end: int) -> int:
+    """Where the export begins: 0, or just past an `e-` room's expired prefix.
+
+    Ephemeral expiry is drop-on-read and a raw dump is a read: streaming records the class
+    promises have stopped being readable would make export the one lane that ignores the
+    TTL. Records are append-ordered, so the expired records are a prefix, and the export
+    starts at the first line whose record is still readable — judged by the same `_expired`
+    the tail read uses, unparsable `ts` failing closed with it. Costs one forward parse of
+    the bytes being dropped, on the `e-` class only; every other room starts at 0 for free.
+    """
+    if cutoff is None:
+        return 0
+    f.seek(0)
+    pos = 0
+    while pos < end:
+        line = f.readline()
+        rec = _parse(line)
+        if rec is not None and not _expired(rec, cutoff):
+            return pos
+        pos += len(line)
+    return end
+
+
+def export_room(root: Path, room: str) -> tuple[int, Iterator[bytes]]:
+    """The room's stored JSONL, bytes as written, snapshotted at open — and the room
+    generation that snapshot belongs to.
+
+    Byte-exact because verifiability demands it: a signed record re-verifies only against
+    the stored `text` bytes exactly as `clean_text` wrote them, so re-serializing — even a
+    round trip through the same encoder — is a way to corrupt proofs, not a formatting
+    choice. The bound is one fstat when the file is opened, truncated to the last complete
+    line (`_snapshot_bytes`), so an append landing mid-export is simply outside the
+    snapshot rather than a torn record inside it. An `e-` room's expired prefix is outside
+    it too (`_export_start`): expiry is drop-on-read, and export is a read.
+
+    Opened HERE, not when the first chunk is pulled, because two things must be settled
+    while an error can still become a status code: a room that exists but cannot be read
+    raises rather than impersonating the documented empty answer — only FileNotFoundError
+    IS that answer — and the generation is read immediately after the open, from the seq
+    state (the fd itself carries no epoch), so the two are captured back to back instead
+    of a request lifetime apart. The gap between the open and that read is the residual
+    race, accepted: closing it needs the seqstate and room locks held together, on a path
+    that deliberately holds neither.
+
+    No lock, held or taken. An append past the snapshot is invisible by the bound above,
+    and compaction replaces the file atomically (`_replace`), so the fd opened here keeps
+    reading the inode it opened — a consistent old ring, never a half-rewritten new one.
+    Holding the flock across a client-paced stream would let one slow reader stall every
+    writer instead.
+
+    An absent room exports as zero bytes, the same nothing `read_messages` reads there:
+    export creates no room and never runs the reaper. The name is validated before the
+    iterator is handed out, so a bad name refuses up front instead of mid-stream.
+    """
+    path = room_path(root, room)
+    try:
+        f = path.open("rb")
+    except FileNotFoundError:
+        return room_generation(root, room), iter(())
+    try:
+        end = _snapshot_bytes(f)
+        start = _export_start(f, _cutoff(room), end)
+        generation = room_generation(root, room)
+    except BaseException:
+        f.close()
+        raise
+
+    def chunks() -> Iterator[bytes]:
+        with f:
+            f.seek(start)
+            remaining = end - start
+            while remaining > 0:
+                block = f.read(min(EXPORT_CHUNK, remaining))
+                if not block:
+                    return  # unreachable on a held inode; never spin on a short read
+                remaining -= len(block)
+                yield block
+
+    return generation, chunks()
+
+
 def _seq_state_path(root: Path) -> Path:
     return root / ".seqstate"
 
@@ -824,7 +927,8 @@ def room_generation(root: Path, room: str) -> int:
     name now carries a different one. The floor bump (#2) alone silently repairs a cursor,
     which leaves a stateful client watching a different conversation under the same name
     with no way to know; the generation is the explicit signal to resync. 0 = never
-    existed, or the conversation has ended (reaped, not yet recreated)."""
+    existed. A reaped room keeps its last generation — `_reap` preserves it in the seq
+    state on purpose — until the name is recreated, which bumps it."""
     entry = _read_seq_state(root).get(room)
     if entry:
         try:
