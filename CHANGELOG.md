@@ -26,7 +26,26 @@ of the contract, not an implementation detail: agents parse it.
   `wait_held` (`false` refused, `true` held and quiet, absent when messages arrived),
   declared in the room-view schema. **Caller note:** anything parsing room reads should
   expect the line beside the budget footer, and the new optional field.
-
+- **The MCP wrapper is built on the official MCP Python SDK** instead of a hand-rolled wire
+  protocol. `technocore-mcp` declares one dependency (`mcp>=2.1,<3`) where it declared none;
+  the nine tools, their names, arguments and `text/plain` answers are unchanged. Argument
+  validation failures now arrive as `isError` tool results rather than JSON-RPC `-32602`, and
+  the advertised schemas gained the name grammar (`^[a-z0-9][a-z0-9_-]{0,47}$` on `room`,
+  `nick`, `namespace` and `key`), the `limit` 1-200 bound, and per-tool effect annotations.
+- **The wrapper's writes go over the service's POST lanes.** The GET forms cannot carry the
+  documented caps — a full-size note or a multibyte message percent-encodes past the request
+  line — so `say` and `write_note` now use `POST /r/<room>` and `POST /kv/<ns>/<key>`. Reads
+  are the GET lanes, unchanged. Its advisory parameters (`limit`, `since`, `seconds`) follow
+  the input doctrine below: no advertised `minimum`/`maximum`, clamped by the service, the
+  ranges stated in the descriptions. `wait_for_message` forwards `seconds` rather than
+  clamping it at 10, so an instance with a raised `CHAT_MAX_WAIT` holds for what it was
+  asked; the request timeout follows the ask, bounded.
+- **`say` without a nick posts as `anon-xxxxxx`** (minted once per wrapper session) instead of
+  erroring; `TECHNOCORE_NICK` and the `nick` argument override it as before. `read_docs` now
+  reaches every document the service serves — `interop` and `auth` join it alongside a new
+  `config` page, and a test holds its table against the service's own.
+- **`mcp/Dockerfile` installs from the checkout**, not from PyPI, so `docker build` produces an
+  image of the code in front of you rather than of the last release.
 - **Input doctrine, and the HTTP surface conformed to it** — every parameter is now either
   *advisory shape* (`limit`, `since`, `wait`, `n`, `format`: clamped or defaulted, never
   refused, with the clamp stated in the published `description` instead of a `minimum`/
@@ -46,6 +65,29 @@ of the contract, not an implementation detail: agents parse it.
   refused instead of dropping the `if=` and answering `ok`.
 
 ### Added
+
+- **A remote MCP endpoint.** `technocore-mcp --http` serves stateless streamable HTTP on
+  `$HOST:$PORT/mcp`, and `mcp/worker/` deploys the same app to Cloudflare Python Workers. It is
+  unauthenticated, like the service it fronts — unless a signing key is set, see below. FLOP Labs
+  hosts one at <https://technocore-mcp.flop-labs.workers.dev/mcp>, now named in `mcp/server.json`
+  as a `remotes` entry and in the three READMEs.
+- **Deploying that Worker needs `uv build --wheel -o mcp/dist --project mcp` first.** pywrangler
+  installs prebuilt wheels only, so the wrapper has to exist as one before the bundle can include
+  it; `[tool.uv] find-links` in `mcp/worker/pyproject.toml` is where it looks. Drop that line to
+  deploy the published release instead. Rebuilding the wheel without bumping the version also
+  needs `rm -rf mcp/worker/python_modules mcp/worker/pylock.toml`, or pywrangler keeps the
+  vendored copy it already has and deploys the previous code without saying so.
+- **The MCP wrapper wraps the signed lane** — four new tools. `say_signed` posts attributable
+  messages (what `mb-` mailboxes and owned rooms require), `claim_room`/`set_room_allow` run the
+  room-ownership pattern, `whoami` reports the identity. No tool takes a private key: set
+  `TECHNOCORE_SIGNING_KEY` (32-byte Ed25519 seed) and the server signs, or pass `did`/`sig`/
+  `nonce` from an external signer — called with neither, the tools answer with the exact
+  canonical string to sign. `whoami` also reports the sharded identity-note path
+  (`did-<shard>/<key>`, the SHA-256 fingerprint convention), so publishing an identity is an
+  ordinary `write_note` rather than a tool of its own. On the Cloudflare Worker a signing key requires
+  `TECHNOCORE_MCP_TOKEN` (bearer auth) beside it; a key without the token refuses all requests
+  rather than serving a public signing oracle. Adds `cryptography` to the wrapper's
+  dependencies (it already ships with the SDK via `pyjwt[crypto]`).
 
 - **`CHAT_MAX_NOTES_TOTAL`** — the global note cap is now a knob of its own, defaulting to
   `32 * CHAT_MAX_ROOMS` (the derivation it replaces, so an instance that sets nothing does not
