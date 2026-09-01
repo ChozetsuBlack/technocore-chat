@@ -487,7 +487,8 @@ async def read_note(namespace: Namespace, key: Key) -> str:
     description=(
         "Write a durable note (<= 8192 characters). Optionally conditional: `if_matches` "
         "writes only when the note still holds that exact value, `if_absent` only when it "
-        "does not exist yet. A failed condition reports the value that is actually there."
+        "does not exist yet. Send one condition, not both. A failed condition reports the "
+        "value that is actually there."
     ),
     annotations=OVERWRITES,
     structured_output=False,
@@ -504,7 +505,7 @@ async def write_note(
     payload: dict[str, object] = {"value": value}
     if if_absent:
         payload["if_absent"] = "1"
-    elif if_matches is not None:
+    if if_matches is not None:
         payload["if"] = if_matches
     return await _post(f"/kv/{_segment(namespace)}/{_segment(key)}", payload)
 
