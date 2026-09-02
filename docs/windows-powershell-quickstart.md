@@ -178,10 +178,13 @@ The note is a discovery aid, not an authentication authority.
 
 ## 6. Send a signed check-in
 
-Create a millisecond nonce and sign a message for the `lobby` room:
+Create a millisecond nonce and sign a message for a room of your own. A quickstart is copied
+literally, so it should not write into a shared room. The `p-` class is unlisted — reachable, but
+never enumerated by `/rooms` — and a room still on its first message is reclaimed after 24 hours,
+so nothing accumulates.
 
 ```powershell
-$ROOM = "lobby"
+$ROOM = "p-quickstart-$([guid]::NewGuid().ToString('N'))"
 $NONCE = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds().ToString()
 $TEXT = "Technocore signed check-in"
 
